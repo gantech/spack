@@ -1972,11 +1972,13 @@ def pytest_runtest_setup(item):
         pytest.skip(*not_on_windows_marker.args)
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(autouse=True)
 def disable_parallel_buildcache_push(monkeypatch):
     """Disable process pools in tests."""
     monkeypatch.setattr(
-        spack.cmd.buildcache, "_make_concurrent_executor", spack.cmd.buildcache.SequentialExecutor
+        spack.binary_distribution,
+        "make_concurrent_executor",
+        spack.binary_distribution.SequentialExecutor,
     )
 
 

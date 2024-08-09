@@ -5,10 +5,13 @@
 
 import codecs
 import collections
+import concurrent.futures
+import contextlib
 import hashlib
 import io
 import itertools
 import json
+import multiprocessing
 import os
 import pathlib
 import re
@@ -22,7 +25,7 @@ import urllib.parse
 import urllib.request
 import warnings
 from contextlib import closing
-from typing import Dict, Iterable, NamedTuple, Optional, Set, Tuple
+from typing import Dict, Generator, Iterable, List, NamedTuple, Optional, Set, Tuple, Union
 from urllib.error import HTTPError, URLError
 
 import llnl.util.filesystem as fsys
@@ -36,6 +39,7 @@ import spack.cmd
 import spack.config as config
 import spack.database as spack_db
 import spack.error
+import spack.hash_types as ht
 import spack.hooks
 import spack.hooks.sbang
 import spack.mirror
@@ -62,6 +66,7 @@ from spack.package_prefs import get_package_dir_permissions, get_package_group
 from spack.relocate_text import utf8_paths_to_single_binary_regex
 from spack.spec import Spec
 from spack.stage import Stage
+from spack.util.cpus import determine_number_of_jobs
 from spack.util.executable import which
 
 BUILD_CACHE_RELATIVE_PATH = "build_cache"
@@ -745,34 +750,25 @@ def tarball_path_name(spec, ext):
     return os.path.join(tarball_directory_name(spec), tarball_name(spec, ext))
 
 
-def select_signing_key(key=None):
-    if key is None:
-        keys = spack.util.gpg.signing_keys()
-        if len(keys) == 1:
-            key = keys[0]
-
-        if len(keys) > 1:
-            raise PickKeyException(str(keys))
-
-        if len(keys) == 0:
-            raise NoKeyException(
-                "No default key available for signing.\n"
-                "Use spack gpg init and spack gpg create"
-                " to create a default key."
-            )
-    return key
+def select_signing_key() -> str:
+    keys = spack.util.gpg.signing_keys()
+    num = len(keys)
+    if num > 1:
+        raise PickKeyException(str(keys))
+    elif num == 0:
+        raise NoKeyException(
+            "No default key available for signing.\n"
+            "Use spack gpg init and spack gpg create"
+            " to create a default key."
+        )
+    return keys[0]
 
 
-def sign_specfile(key, force, specfile_path):
-    signed_specfile_path = "%s.sig" % specfile_path
-    if os.path.exists(signed_specfile_path):
-        if force:
-            os.remove(signed_specfile_path)
-        else:
-            raise NoOverwriteException(signed_specfile_path)
-
-    key = select_signing_key(key)
+def sign_specfile(key: str, specfile_path: str) -> str:
+    """sign and return the path to the signed specfile"""
+    signed_specfile_path = f"{specfile_path}.sig"
     spack.util.gpg.sign(key, specfile_path, signed_specfile_path, clearsign=True)
+    return signed_specfile_path
 
 
 def _read_specs_and_push_index(file_list, read_method, cache_prefix, db, temp_dir, concurrency):
@@ -880,7 +876,7 @@ def _specs_from_cache_aws_cli(cache_prefix):
     return file_list, read_fn
 
 
-def _specs_from_cache_fallback(cache_prefix):
+def _specs_from_cache_fallback(url: str):
     """Use spack.util.web module to get a list of all the specs at the remote url.
 
     Args:
@@ -905,25 +901,25 @@ def _specs_from_cache_fallback(cache_prefix):
 
     try:
         file_list = [
-            url_util.join(cache_prefix, entry)
-            for entry in web_util.list_url(cache_prefix)
+            url_util.join(url, entry)
+            for entry in web_util.list_url(url)
             if entry.endswith("spec.json") or entry.endswith("spec.json.sig")
         ]
         read_fn = url_read_method
     except Exception as err:
         # If we got some kind of S3 (access denied or other connection error), the first non
         # boto-specific class in the exception is Exception.  Just print a warning and return
-        tty.warn(f"Encountered problem listing packages at {cache_prefix}: {err}")
+        tty.warn(f"Encountered problem listing packages at {url}: {err}")
 
     return file_list, read_fn
 
 
-def _spec_files_from_cache(cache_prefix):
+def _spec_files_from_cache(url: str):
     """Get a list of all the spec files in the mirror and a function to
     read them.
 
     Args:
-        cache_prefix (str): Base url of mirror (location of spec files)
+        url: Base url of mirror (location of spec files)
 
     Return:
         A tuple where the first item is a list of absolute file paths or
@@ -932,56 +928,49 @@ def _spec_files_from_cache(cache_prefix):
         returning the spec read from that location.
     """
     callbacks = []
-    if cache_prefix.startswith("s3"):
+    if url.startswith("s3://"):
         callbacks.append(_specs_from_cache_aws_cli)
 
     callbacks.append(_specs_from_cache_fallback)
 
     for specs_from_cache_fn in callbacks:
-        file_list, read_fn = specs_from_cache_fn(cache_prefix)
+        file_list, read_fn = specs_from_cache_fn(url)
         if file_list:
             return file_list, read_fn
 
-    raise ListMirrorSpecsError("Failed to get list of specs from {0}".format(cache_prefix))
+    raise ListMirrorSpecsError("Failed to get list of specs from {0}".format(url))
 
 
-def generate_package_index(cache_prefix, concurrency=32):
+def generate_package_index(url: str, tmpdir: str, concurrency: int = 32):
     """Create or replace the build cache index on the given mirror.  The
     buildcache index contains an entry for each binary package under the
     cache_prefix.
 
     Args:
-        cache_prefix(str): Base url of binary mirror.
-        concurrency: (int): The desired threading concurrency to use when
-            fetching the spec files from the mirror.
+        url: Base url of binary mirror.
+        concurrency: The desired threading concurrency to use when fetching the spec files from
+            the mirror.
 
     Return:
         None
     """
+    url = url_util.join(url, build_cache_relative_path())
     try:
-        file_list, read_fn = _spec_files_from_cache(cache_prefix)
+        file_list, read_fn = _spec_files_from_cache(url)
     except ListMirrorSpecsError as e:
         raise GenerateIndexError(f"Unable to generate package index: {e}") from e
 
-    tty.debug(f"Retrieving spec descriptor files from {cache_prefix} to build index")
-
-    tmpdir = tempfile.mkdtemp()
+    tty.debug(f"Retrieving spec descriptor files from {url} to build index")
 
     db = BuildCacheDatabase(tmpdir)
-    db.root = None
-    db_root_dir = db.database_directory
 
     try:
-        _read_specs_and_push_index(file_list, read_fn, cache_prefix, db, db_root_dir, concurrency)
+        _read_specs_and_push_index(file_list, read_fn, url, db, db.database_directory, concurrency)
     except Exception as e:
-        raise GenerateIndexError(
-            f"Encountered problem pushing package index to {cache_prefix}: {e}"
-        ) from e
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise GenerateIndexError(f"Encountered problem pushing package index to {url}: {e}") from e
 
 
-def generate_key_index(key_prefix, tmpdir=None):
+def generate_key_index(key_prefix: str, tmpdir: str) -> None:
     """Create the key index page.
 
     Creates (or replaces) the "index.json" page at the location given in key_prefix.  This page
@@ -999,36 +988,23 @@ def generate_key_index(key_prefix, tmpdir=None):
     except Exception as e:
         raise CannotListKeys(f"Encountered problem listing keys at {key_prefix}: {e}") from e
 
-    remove_tmpdir = False
-
-    keys_local = url_util.local_file_path(key_prefix)
-    if keys_local:
-        target = os.path.join(keys_local, "index.json")
-    else:
-        if not tmpdir:
-            tmpdir = tempfile.mkdtemp()
-            remove_tmpdir = True
-        target = os.path.join(tmpdir, "index.json")
+    target = os.path.join(tmpdir, "index.json")
 
     index = {"keys": dict((fingerprint, {}) for fingerprint in sorted(set(fingerprints)))}
     with open(target, "w") as f:
         sjson.dump(index, f)
 
-    if not keys_local:
-        try:
-            web_util.push_to_url(
-                target,
-                url_util.join(key_prefix, "index.json"),
-                keep_original=False,
-                extra_args={"ContentType": "application/json"},
-            )
-        except Exception as e:
-            raise GenerateIndexError(
-                f"Encountered problem pushing key index to {key_prefix}: {e}"
-            ) from e
-        finally:
-            if remove_tmpdir:
-                shutil.rmtree(tmpdir, ignore_errors=True)
+    try:
+        web_util.push_to_url(
+            target,
+            url_util.join(key_prefix, "index.json"),
+            keep_original=False,
+            extra_args={"ContentType": "application/json"},
+        )
+    except Exception as e:
+        raise GenerateIndexError(
+            f"Encountered problem pushing key index to {key_prefix}: {e}"
+        ) from e
 
 
 def tarfile_of_spec_prefix(tar: tarfile.TarFile, prefix: str) -> None:
@@ -1079,127 +1055,250 @@ def _do_create_tarball(tarfile_path: str, binaries_dir: str, buildinfo: dict):
     return inner_checksum.hexdigest(), outer_checksum.hexdigest()
 
 
-class PushOptions(NamedTuple):
-    #: Overwrite existing tarball/metadata files in buildcache
-    force: bool = False
+class SequentialExecutor(concurrent.futures.Executor):
+    """Executor that runs tasks sequentially in the current thread."""
 
-    #: Regenerated indices after pushing
-    regenerate_index: bool = False
-
-    #: Whether to sign or not.
-    unsigned: bool = False
-
-    #: What key to use for signing
-    key: Optional[str] = None
-
-
-def push_or_raise(spec: Spec, out_url: str, options: PushOptions):
-    """
-    Build a tarball from given spec and put it into the directory structure
-    used at the mirror (following <tarball_directory_name>).
-
-    This method raises :py:class:`NoOverwriteException` when ``force=False`` and the tarball or
-    spec.json file already exist in the buildcache. It raises :py:class:`PushToBuildCacheError`
-    when the tarball or spec.json file cannot be pushed to the buildcache.
-    """
-    if not spec.concrete:
-        raise ValueError("spec must be concrete to build tarball")
-
-    with tempfile.TemporaryDirectory(dir=spack.stage.get_stage_root()) as tmpdir:
-        _build_tarball_in_stage_dir(spec, out_url, stage_dir=tmpdir, options=options)
+    def submit(self, fn, *args, **kwargs):
+        """Submit a function to be executed."""
+        future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except Exception as e:
+            future.set_exception(e)
+        return future
 
 
-def _build_tarball_in_stage_dir(spec: Spec, out_url: str, stage_dir: str, options: PushOptions):
-    cache_prefix = build_cache_prefix(stage_dir)
-    tarfile_name = tarball_name(spec, ".spack")
-    tarfile_dir = os.path.join(cache_prefix, tarball_directory_name(spec))
-    tarfile_path = os.path.join(tarfile_dir, tarfile_name)
-    spackfile_path = os.path.join(cache_prefix, tarball_path_name(spec, ".spack"))
-    remote_spackfile_path = url_util.join(out_url, os.path.relpath(spackfile_path, stage_dir))
+def make_concurrent_executor() -> concurrent.futures.Executor:
+    """Can't use threading because it's unsafe, and can't use spawned processes because of globals.
+    That leaves only forking"""
+    if multiprocessing.get_start_method() == "fork":
+        return concurrent.futures.ProcessPoolExecutor(determine_number_of_jobs(parallel=True))
+    else:
+        return SequentialExecutor()
 
-    mkdirp(tarfile_dir)
-    if web_util.url_exists(remote_spackfile_path):
-        if options.force:
-            web_util.remove_url(remote_spackfile_path)
-        else:
-            raise NoOverwriteException(url_util.format(remote_spackfile_path))
 
-    # need to copy the spec file so the build cache can be downloaded
-    # without concretizing with the current spack packages
-    # and preferences
+class ExistsInBuildcache(NamedTuple):
+    signed: bool
+    unsigned: bool
+    tarball: bool
 
-    spec_file = spack.store.STORE.layout.spec_file_path(spec)
-    specfile_name = tarball_name(spec, ".spec.json")
-    specfile_path = os.path.realpath(os.path.join(cache_prefix, specfile_name))
-    signed_specfile_path = "{0}.sig".format(specfile_path)
 
-    remote_specfile_path = url_util.join(
-        out_url, os.path.relpath(specfile_path, os.path.realpath(stage_dir))
-    )
-    remote_signed_specfile_path = "{0}.sig".format(remote_specfile_path)
+class BuildcacheFiles:
+    def __init__(self, spec: Spec, local: str, remote: str):
+        """
+        Args:
+            spec: The spec whose tarball and specfile are being managed.
+            local: The local path to the buildcache.
+            remote: The remote URL to the buildcache.
+        """
+        self.local = local
+        self.remote = remote
+        self.spec = spec
 
-    # If force and exists, overwrite. Otherwise raise exception on collision.
-    if options.force:
-        if web_util.url_exists(remote_specfile_path):
-            web_util.remove_url(remote_specfile_path)
-        if web_util.url_exists(remote_signed_specfile_path):
-            web_util.remove_url(remote_signed_specfile_path)
-    elif web_util.url_exists(remote_specfile_path) or web_util.url_exists(
-        remote_signed_specfile_path
-    ):
-        raise NoOverwriteException(url_util.format(remote_specfile_path))
+    def remote_specfile(self, signed: bool) -> str:
+        return url_util.join(
+            self.remote,
+            build_cache_relative_path(),
+            tarball_name(self.spec, ".spec.json.sig" if signed else ".spec.json"),
+        )
 
-    binaries_dir = spec.prefix
+    def remote_tarball(self) -> str:
+        return url_util.join(
+            self.remote, build_cache_relative_path(), tarball_path_name(self.spec, ".spack")
+        )
 
-    # create info for later relocation and create tar
-    buildinfo = get_buildinfo_dict(spec)
+    def local_specfile(self) -> str:
+        return os.path.join(self.local, f"{self.spec.dag_hash()}.spec.json")
 
-    checksum, _ = _do_create_tarball(tarfile_path, binaries_dir, buildinfo)
+    def local_tarball(self) -> str:
+        return os.path.join(self.local, f"{self.spec.dag_hash()}.tar.gz")
 
-    # add sha256 checksum to spec.json
-    with open(spec_file, "r") as inputfile:
-        content = inputfile.read()
-        if spec_file.endswith(".json"):
-            spec_dict = sjson.load(content)
-        else:
-            raise ValueError("{0} not a valid spec file type".format(spec_file))
+
+def _exists_in_buildcache(spec: Spec, tmpdir: str, out_url: str) -> ExistsInBuildcache:
+    """returns a tuple of bools (signed, unsigned, tarball) indicating whether specfiles/tarballs
+    exist in the buildcache"""
+    files = BuildcacheFiles(spec, tmpdir, out_url)
+    signed = web_util.url_exists(files.remote_specfile(signed=True))
+    unsigned = web_util.url_exists(files.remote_specfile(signed=False))
+    tarball = web_util.url_exists(files.remote_tarball())
+    return ExistsInBuildcache(signed, unsigned, tarball)
+
+
+def _upload_tarball_and_specfile(
+    spec: Spec, tmpdir: str, out_url: str, exists: ExistsInBuildcache, signing_key: Optional[str]
+):
+    files = BuildcacheFiles(spec, tmpdir, out_url)
+    tarball = files.local_tarball()
+    checksum, _ = _do_create_tarball(tarball, spec.prefix, get_buildinfo_dict(spec))
+    spec_dict = spec.to_dict(hash=ht.dag_hash)
     spec_dict["buildcache_layout_version"] = CURRENT_BUILD_CACHE_LAYOUT_VERSION
     spec_dict["binary_cache_checksum"] = {"hash_algorithm": "sha256", "hash": checksum}
 
-    with open(specfile_path, "w") as outfile:
+    if exists.tarball:
+        web_util.remove_url(files.remote_tarball())
+    if exists.signed:
+        web_util.remove_url(files.remote_specfile(signed=True))
+    if exists.unsigned:
+        web_util.remove_url(files.remote_specfile(signed=False))
+    web_util.push_to_url(tarball, files.remote_tarball(), keep_original=False)
+
+    specfile = files.local_specfile()
+    with open(specfile, "w") as f:
         # Note: when using gpg clear sign, we need to avoid long lines (19995 chars).
         # If lines are longer, they are truncated without error. Thanks GPG!
         # So, here we still add newlines, but no indent, so save on file size and
         # line length.
-        json.dump(spec_dict, outfile, indent=0, separators=(",", ":"))
+        json.dump(spec_dict, f, indent=0, separators=(",", ":"))
 
     # sign the tarball and spec file with gpg
-    if not options.unsigned:
-        key = select_signing_key(options.key)
-        sign_specfile(key, options.force, specfile_path)
+    if signing_key:
+        specfile = sign_specfile(signing_key, specfile)
 
-    try:
-        # push tarball and signed spec json to remote mirror
-        web_util.push_to_url(spackfile_path, remote_spackfile_path, keep_original=False)
-        web_util.push_to_url(
-            signed_specfile_path if not options.unsigned else specfile_path,
-            remote_signed_specfile_path if not options.unsigned else remote_specfile_path,
-            keep_original=False,
-        )
-    except Exception as e:
+    web_util.push_to_url(
+        specfile, files.remote_specfile(signed=bool(signing_key)), keep_original=False
+    )
+
+
+def _progress(i: int, total: int):
+    if total > 1:
+        digits = len(str(total))
+        return f"[{i+1:{digits}}/{total}] "
+    return ""
+
+
+def _format_spec(spec: Spec) -> str:
+    return spec.cformat("{name}{@version}{/hash:7}")
+
+
+@contextlib.contextmanager
+def default_push_context() -> Generator[Tuple[str, concurrent.futures.Executor], None, None]:
+    with tempfile.TemporaryDirectory(
+        dir=spack.stage.get_stage_root()
+    ) as tmpdir, make_concurrent_executor() as executor:
+        yield tmpdir, executor
+
+
+def push_or_raise(
+    specs: List[Spec],
+    out_url: str,
+    signing_key: Optional[str],
+    force: bool = False,
+    update_index: bool = False,
+) -> List[Spec]:
+    """Same as push, but raises an exception on error. Returns a list of skipped specs already
+    present in the build cache when force=False."""
+    skipped, errors = push(specs, out_url, signing_key, force, update_index)
+    if errors:
         raise PushToBuildCacheError(
-            f"Encountered problem pushing binary {remote_spackfile_path}: {e}"
-        ) from e
+            f"Failed to push {len(errors)} specs to {out_url}:\n"
+            + "\n".join(
+                f"Failed to push {_format_spec(spec.name)}: {error}" for spec, error in errors
+            )
+        )
+    return skipped
 
-    # push the key to the build cache's _pgp directory so it can be
-    # imported
-    if not options.unsigned:
-        push_keys(out_url, keys=[key], regenerate_index=options.regenerate_index, tmpdir=stage_dir)
 
-    # create an index.json for the build_cache directory so specs can be
-    # found
-    if options.regenerate_index:
-        generate_package_index(url_util.join(out_url, os.path.relpath(cache_prefix, stage_dir)))
+def push(
+    specs: List[Spec],
+    out_url: str,
+    signing_key: Optional[str],
+    force: bool = False,
+    update_index: bool = False,
+) -> Tuple[List[Spec], List[Tuple[Spec, BaseException]]]:
+    """Pushes to the provided build cache, and returns a list of skipped specs that were already
+    present (when force=False). Does not raise on error."""
+    with default_push_context() as (tmpdir, executor):
+        return _push(specs, out_url, signing_key, force, update_index, tmpdir, executor)
+
+
+def _push(
+    specs: List[Spec],
+    out_url: str,
+    signing_key: Optional[str],
+    force: bool,
+    update_index: bool,
+    tmpdir: str,
+    executor: concurrent.futures.Executor,
+) -> Tuple[List[Spec], List[Tuple[Spec, BaseException]]]:
+    """Pushes to the provided build cache, and returns a list of skipped specs that were already
+    present (when force=False), and a list of errors. Does not raise on error."""
+    skipped: List[Spec] = []
+    errors: List[Tuple[Spec, BaseException]] = []
+
+    exists_futures = [
+        executor.submit(_exists_in_buildcache, spec, tmpdir, out_url) for spec in specs
+    ]
+
+    exists = {
+        spec.dag_hash(): exists_future.result()
+        for spec, exists_future in zip(specs, exists_futures)
+    }
+
+    if not force:
+        specs_to_upload = []
+
+        for spec in specs:
+            signed, unsigned, tarball = exists[spec.dag_hash()]
+            if (signed or unsigned) and tarball:
+                skipped.append(spec)
+            else:
+                specs_to_upload.append(spec)
+    else:
+        specs_to_upload = specs
+
+    if not specs_to_upload:
+        return skipped, errors
+
+    total = len(specs_to_upload)
+
+    tty.info(f"{total} specs need to be pushed to {out_url}")
+
+    upload_futures = [
+        executor.submit(
+            _upload_tarball_and_specfile,
+            spec,
+            tmpdir,
+            out_url,
+            exists[spec.dag_hash()],
+            signing_key,
+        )
+        for spec in specs_to_upload
+    ]
+
+    uploaded = 0
+    print_progress = sys.stdout.isatty()
+
+    for i, (spec, upload_future) in enumerate(zip(specs_to_upload, upload_futures)):
+        progress = _progress(i, total)
+        pretty_spec = _format_spec(spec)
+        running = upload_future.running()
+        if print_progress and running:
+            tty.info(f"{progress}Pushing {pretty_spec}...")
+        error = upload_future.exception()
+        if error is None:
+            uploaded += 1
+            if print_progress:
+                if running:
+                    sys.stdout.write("\033[F\033[K")
+                tty.info(f"{progress}Pushed {pretty_spec}")
+        else:
+            errors.append((spec, error))
+
+    # don't bother pushing keys / index if all failed to upload
+    if not uploaded:
+        return skipped, errors
+
+    if signing_key:
+        keys_tmpdir = os.path.join(tmpdir, "keys")
+        os.mkdir(keys_tmpdir)
+        push_keys(out_url, keys=[signing_key], update_index=update_index, tmpdir=keys_tmpdir)
+
+    if update_index:
+        index_tmpdir = os.path.join(tmpdir, "index")
+        os.mkdir(index_tmpdir)
+        generate_package_index(out_url, index_tmpdir)
+
+    return skipped, errors
 
 
 def try_verify(specfile_path):
@@ -2137,67 +2236,32 @@ def get_keys(install=False, trust=False, force=False, mirrors=None):
                     )
 
 
-def push_keys(*mirrors, **kwargs):
-    """
-    Upload pgp public keys to the given mirrors
-    """
-    keys = kwargs.get("keys")
-    regenerate_index = kwargs.get("regenerate_index", False)
-    tmpdir = kwargs.get("tmpdir")
-    remove_tmpdir = False
+def push_keys(
+    *mirrors: Union[spack.mirror.Mirror, str],
+    keys: List[str],
+    tmpdir: str,
+    update_index: bool = False,
+):
+    """Upload pgp public keys to the given mirrors"""
+    keys = spack.util.gpg.public_keys(*(keys or ()))
+    files = [os.path.join(tmpdir, f"{key}.pub") for key in keys]
 
-    keys = spack.util.gpg.public_keys(*(keys or []))
+    for key, file in zip(keys, files):
+        spack.util.gpg.export_keys(file, [key])
 
-    try:
-        for mirror in mirrors:
-            push_url = getattr(mirror, "push_url", mirror)
-            keys_url = url_util.join(
-                push_url, BUILD_CACHE_RELATIVE_PATH, BUILD_CACHE_KEYS_RELATIVE_PATH
-            )
-            keys_local = url_util.local_file_path(keys_url)
+    for mirror in mirrors:
+        push_url = mirror if isinstance(mirror, str) else mirror.push_url
+        keys_url = url_util.join(
+            push_url, BUILD_CACHE_RELATIVE_PATH, BUILD_CACHE_KEYS_RELATIVE_PATH
+        )
 
-            verb = "Writing" if keys_local else "Uploading"
-            tty.debug("{0} public keys to {1}".format(verb, url_util.format(push_url)))
+        tty.debug(f"Pushing public keys to {url_util.format(push_url)}")
 
-            if keys_local:  # mirror is local, don't bother with the tmpdir
-                prefix = keys_local
-                mkdirp(keys_local)
-            else:
-                # A tmp dir is created for the first mirror that is non-local.
-                # On the off-hand chance that all the mirrors are local, then
-                # we can avoid the need to create a tmp dir.
-                if tmpdir is None:
-                    tmpdir = tempfile.mkdtemp()
-                    remove_tmpdir = True
-                prefix = tmpdir
+        for key, file in zip(keys, files):
+            web_util.push_to_url(file, url_util.join(keys_url, os.path.basename(file)))
 
-            for fingerprint in keys:
-                tty.debug("    " + fingerprint)
-                filename = fingerprint + ".pub"
-
-                export_target = os.path.join(prefix, filename)
-
-                # Export public keys (private is set to False)
-                spack.util.gpg.export_keys(export_target, [fingerprint])
-
-                # If mirror is local, the above export writes directly to the
-                # mirror (export_target points directly to the mirror).
-                #
-                # If not, then export_target is a tmpfile that needs to be
-                # uploaded to the mirror.
-                if not keys_local:
-                    spack.util.web.push_to_url(
-                        export_target, url_util.join(keys_url, filename), keep_original=False
-                    )
-
-            if regenerate_index:
-                if keys_local:
-                    generate_key_index(keys_url)
-                else:
-                    generate_key_index(keys_url, tmpdir)
-    finally:
-        if remove_tmpdir:
-            shutil.rmtree(tmpdir)
+        if update_index:
+            generate_key_index(keys_url, tmpdir=tmpdir)
 
 
 def needs_rebuild(spec, mirror_url):

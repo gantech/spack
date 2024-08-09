@@ -8,8 +8,6 @@ import copy
 import glob
 import hashlib
 import json
-import multiprocessing
-import multiprocessing.pool
 import os
 import shutil
 import sys
@@ -40,7 +38,6 @@ import spack.util.crypto
 import spack.util.url as url_util
 import spack.util.web as web_util
 from spack import traverse
-from spack.build_environment import determine_number_of_jobs
 from spack.cmd import display_specs
 from spack.cmd.common import arguments
 from spack.oci.image import (
@@ -342,35 +339,6 @@ def _format_spec(spec: Spec) -> str:
     return spec.cformat("{name}{@version}{/hash:7}")
 
 
-def _progress(i: int, total: int):
-    if total > 1:
-        digits = len(str(total))
-        return f"[{i+1:{digits}}/{total}] "
-    return ""
-
-
-class SequentialExecutor(concurrent.futures.Executor):
-    """Executor that runs tasks sequentially in the current thread."""
-
-    def submit(self, fn, *args, **kwargs):
-        """Submit a function to be executed."""
-        future = concurrent.futures.Future()
-        try:
-            future.set_result(fn(*args, **kwargs))
-        except Exception as e:
-            future.set_exception(e)
-        return future
-
-
-def _make_concurrent_executor() -> concurrent.futures.Executor:
-    """Can't use threading because it's unsafe, and can't use spawned processes because of globals.
-    That leaves only forking"""
-    if multiprocessing.get_start_method() == "fork":
-        return concurrent.futures.ProcessPoolExecutor(determine_number_of_jobs(parallel=True))
-    else:
-        return SequentialExecutor()
-
-
 def _skip_no_redistribute_for_public(specs):
     remaining_specs = list()
     removed_specs = list()
@@ -469,6 +437,10 @@ def push_fn(args):
                 "Code signing is currently not supported for OCI images. "
                 "Use --unsigned to silence this warning."
             )
+        unsigned = True
+
+    # Select a signing key, or None if unsigned.
+    signing_key = None if unsigned else (args.key or bindist.select_signing_key())
 
     specs = _specs_to_be_packaged(
         roots,
@@ -495,19 +467,16 @@ def push_fn(args):
                     (s, spack.error.SpackError("package not installed")) for s in not_installed
                 )
 
-    # TODO: move into bindist.push_or_raise
-    if target_image:
-        base_image = ImageReference.from_string(args.base_image) if args.base_image else None
-        with tempfile.TemporaryDirectory(
-            dir=spack.stage.get_stage_root()
-        ) as tmpdir, _make_concurrent_executor() as pool:
+    with bindist.default_push_context() as (tmpdir, executor):
+        if target_image:
+            base_image = ImageReference.from_string(args.base_image) if args.base_image else None
             skipped, base_images, checksums, upload_errors = _push_oci(
                 target_image=target_image,
                 base_image=base_image,
                 installed_specs_with_deps=specs,
                 force=args.force,
                 tmpdir=tmpdir,
-                executor=pool,
+                executor=executor,
             )
 
             if upload_errors:
@@ -517,7 +486,7 @@ def push_fn(args):
             # separate image tag for all root specs and their runtime dependencies.
             elif args.tag:
                 tagged_image = target_image.with_tag(args.tag)
-                # _push_oci may not populate base_images if binaries were already in the registry
+                # push_oci may not populate base_images if binaries were already in the registry
                 for spec in roots:
                     _update_base_images(
                         base_image=base_image,
@@ -528,37 +497,17 @@ def push_fn(args):
                 _put_manifest(base_images, checksums, tagged_image, tmpdir, None, None, *roots)
                 tty.info(f"Tagged {tagged_image}")
 
-    else:
-        skipped = []
-
-        for i, spec in enumerate(specs):
-            try:
-                bindist.push_or_raise(
-                    spec,
-                    push_url,
-                    bindist.PushOptions(
-                        force=args.force,
-                        unsigned=unsigned,
-                        key=args.key,
-                        regenerate_index=args.update_index,
-                    ),
-                )
-
-                msg = f"{_progress(i, len(specs))}Pushed {_format_spec(spec)}"
-                if len(specs) == 1:
-                    msg += f" to {push_url}"
-                tty.info(msg)
-
-            except bindist.NoOverwriteException:
-                skipped.append(_format_spec(spec))
-
-            # Catch any other exception unless the fail fast option is set
-            except Exception as e:
-                if args.fail_fast or isinstance(
-                    e, (bindist.PickKeyException, bindist.NoKeyException)
-                ):
-                    raise
-                failed.append((spec, e))
+        else:
+            skipped, upload_errors = bindist._push(
+                specs,
+                out_url=push_url,
+                force=args.force,
+                update_index=args.update_index,
+                signing_key=signing_key,
+                tmpdir=tmpdir,
+                executor=executor,
+            )
+            failed.extend(upload_errors)
 
     if skipped:
         if len(specs) == 1:
@@ -591,13 +540,11 @@ def push_fn(args):
             ),
         )
 
-    # Update the index if requested
-    # TODO: remove update index logic out of bindist; should be once after all specs are pushed
-    # not once per spec.
+    # Update the OCI index if requested
     if target_image and len(skipped) < len(specs) and args.update_index:
         with tempfile.TemporaryDirectory(
             dir=spack.stage.get_stage_root()
-        ) as tmpdir, _make_concurrent_executor() as pool:
+        ) as tmpdir, bindist.make_concurrent_executor() as pool:
             _update_index_oci(target_image, tmpdir, pool)
 
 
@@ -788,16 +735,14 @@ def _update_base_images(
         )
 
 
-def _push_oci(
+def push_oci(
     *,
     target_image: ImageReference,
     base_image: Optional[ImageReference],
     installed_specs_with_deps: List[Spec],
-    tmpdir: str,
-    executor: concurrent.futures.Executor,
     force: bool = False,
 ) -> Tuple[
-    List[str],
+    List[Spec],
     Dict[str, Tuple[dict, dict]],
     Dict[str, spack.oci.oci.Blob],
     List[Tuple[Spec, BaseException]],
@@ -805,7 +750,7 @@ def _push_oci(
     """Push specs to an OCI registry
 
     Args:
-        image_ref: The target OCI image
+        target_image: The target OCI image
         base_image: Optional base image, which will be copied to the target registry.
         installed_specs_with_deps: The installed specs to push, excluding externals,
             including deps, ordered from roots to leaves.
@@ -817,6 +762,31 @@ def _push_oci(
         a dictionary mapping each spec's dag hash to a blob,
         and a list of tuples of specs with errors of failed uploads.
     """
+    with bindist.default_push_context() as (tmpdir, executor):
+        return _push_oci(
+            target_image=target_image,
+            base_image=base_image,
+            installed_specs_with_deps=installed_specs_with_deps,
+            tmpdir=tmpdir,
+            executor=executor,
+            force=force,
+        )
+
+
+def _push_oci(
+    *,
+    target_image: ImageReference,
+    base_image: Optional[ImageReference],
+    installed_specs_with_deps: List[Spec],
+    tmpdir: str,
+    executor: concurrent.futures.Executor,
+    force: bool = False,
+) -> Tuple[
+    List[Spec],
+    Dict[str, Tuple[dict, dict]],
+    Dict[str, spack.oci.oci.Blob],
+    List[Tuple[Spec, BaseException]],
+]:
 
     # Reverse the order
     installed_specs_with_deps = list(reversed(installed_specs_with_deps))
@@ -828,7 +798,7 @@ def _push_oci(
     base_images: Dict[str, Tuple[dict, dict]] = {}
 
     # Specs not uploaded because they already exist
-    skipped = []
+    skipped: List[Spec] = []
 
     if not force:
         tty.info("Checking for existing specs in the buildcache")
@@ -840,7 +810,7 @@ def _push_oci(
         for spec, maybe_blob in zip(installed_specs_with_deps, available_blobs):
             if maybe_blob is not None:
                 checksums[spec.dag_hash()] = maybe_blob
-                skipped.append(_format_spec(spec))
+                skipped.append(spec)
             else:
                 blobs_to_upload.append(spec)
     else:
@@ -885,7 +855,7 @@ def _push_oci(
 
     def extra_config(spec: Spec):
         spec_dict = spec.to_dict(hash=ht.dag_hash)
-        spec_dict["buildcache_layout_version"] = 1
+        spec_dict["buildcache_layout_version"] = bindist.CURRENT_BUILD_CACHE_LAYOUT_VERSION
         spec_dict["binary_cache_checksum"] = {
             "hash_algorithm": "sha256",
             "hash": checksums[spec.dag_hash()].compressed_digest.digest,
@@ -1274,14 +1244,15 @@ def update_index(mirror: spack.mirror.Mirror, update_keys=False):
     if image_ref:
         with tempfile.TemporaryDirectory(
             dir=spack.stage.get_stage_root()
-        ) as tmpdir, _make_concurrent_executor() as pool:
+        ) as tmpdir, bindist.make_concurrent_executor() as pool:
             _update_index_oci(image_ref, tmpdir, pool)
         return
 
     # Otherwise, assume a normal mirror.
     url = mirror.push_url
 
-    bindist.generate_package_index(url_util.join(url, bindist.build_cache_relative_path()))
+    with tempfile.TemporaryDirectory(dir=spack.stage.get_stage_root()) as tmpdir:
+        bindist.generate_package_index(url, tmpdir)
 
     if update_keys:
         keys_url = url_util.join(
@@ -1289,7 +1260,8 @@ def update_index(mirror: spack.mirror.Mirror, update_keys=False):
         )
 
         try:
-            bindist.generate_key_index(keys_url)
+            with tempfile.TemporaryDirectory(dir=spack.stage.get_stage_root()) as tmpdir:
+                bindist.generate_key_index(keys_url, tmpdir)
         except bindist.CannotListKeys as e:
             # Do not error out if listing keys went wrong. This usually means that the _gpg path
             # does not exist. TODO: distinguish between this and other errors.

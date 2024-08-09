@@ -611,11 +611,7 @@ def test_install_from_binary_with_missing_patch_succeeds(
 
     # Push it to a binary cache
     build_cache = tmp_path / "my_build_cache"
-    binary_distribution.push_or_raise(
-        s,
-        build_cache.as_uri(),
-        binary_distribution.PushOptions(unsigned=True, regenerate_index=True),
-    )
+    binary_distribution.push([s], out_url=build_cache.as_uri(), signing_key=None, force=False)
 
     # Now re-install it.
     s.package.do_uninstall()
